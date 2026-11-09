@@ -1,0 +1,427 @@
+package com.singhujjawalai.shotsense
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.database.ContentObserver
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.provider.MediaStore
+import android.util.Log
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+class ScreenshotDetectorService : Service() {
+    companion object {
+        const val CHANNEL_ID = "shotsense_service"
+        const val NOTIFICATION_ID = 101
+        private const val ALERT_CHANNEL_ID = "shotsense_screenshot_alerts"
+        private const val TAG = "ScreenshotDetector"
+        private const val PREFS = "ShotSenseDetector"
+        private const val KEY_BASELINED = "screenshots_baselined"
+        private const val KEY_PROCESSED = "processed_screenshot_ids"
+        private const val KEY_LAST_SCAN = "last_scan_seconds"
+            private const val POLL_INTERVAL_MS = 10_000L
+        private const val BACKFILL_BATCH = 10
+
+        @Volatile
+        var isRunning = false
+    }
+
+    private lateinit var workerThread: HandlerThread
+    private lateinit var worker: Handler
+    private var observer: ContentObserver? = null
+    private var count = 0
+    private var processedIds = mutableSetOf<String>()
+    private var lastScanSeconds = 0L
+    private var baselinePending = true
+    private var backfillEnabled = true
+    private val backfillFailures = mutableSetOf<String>()
+
+    override fun onCreate() {
+        super.onCreate()
+        isRunning = true
+        val logFile = File(getExternalFilesDir(null), "service_verification_log.txt")
+        logFile.appendText("[${System.currentTimeMillis()}] SERVICE CREATED\n")
+        createNotificationChannels()
+        startForeground(NOTIFICATION_ID, buildStatusNotification())
+        // Make sure the revive-watchdog is armed (self-rescheduling exact alarm).
+        DeletionManager.scheduleWatchdog(this)
+        workerThread = HandlerThread("ShotSenseMediaScan").also { it.start() }
+        worker = Handler(workerThread.looper)
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        baselinePending = !prefs.getBoolean(KEY_BASELINED, false)
+        processedIds = prefs.getStringSet(KEY_PROCESSED, emptySet())?.toMutableSet() ?: mutableSetOf()
+        lastScanSeconds = prefs.getLong(KEY_LAST_SCAN, System.currentTimeMillis() / 1000L)
+        count = getFlutterCount()
+        updateStatusNotification()
+        registerObserver()
+        worker.post { migrateClassifierVersions() }
+        worker.post(scanRunnable)
+    }
+
+    private val scanRunnable = object : Runnable {
+        override fun run() {
+            scanMediaStore()
+            backfillOcrBatch()
+            worker.postDelayed(this, POLL_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Progressively OCRs the pre-existing screenshot backlog (skipped by the
+     * first-run baseline) so content search, Codes and Bills cover the whole
+     * gallery. Runs one small batch per scan cycle until every indexed image
+     * has an OCR entry, then goes idle until the service restarts.
+     */
+    private fun backfillOcrBatch() {
+        if (!backfillEnabled) return
+        try {
+            val known = OcrStore.all(this).keys.toSet()
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.Images.Media.DATA,
+            )
+            var processed = 0
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection, null, null,
+                "${MediaStore.Images.Media.DATE_ADDED} DESC",
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
+                while (cursor.moveToNext() && processed < BACKFILL_BATCH) {
+                    val name = cursor.getString(nameCol) ?: continue
+                    val path = cursor.getString(dataCol) ?: continue
+                    if (!isScreenshot(name, path)) continue
+                    if (known.contains(path) || backfillFailures.contains(path)) continue
+                    val uri = Uri.withAppendedPath(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        cursor.getLong(idCol).toString()
+                    ).toString()
+                    val entry = runOcr(uri, path, name)
+                    if (entry != null) {
+                        OcrStore.put(this, entry)
+                    } else {
+                        // Don't retry permanently unreadable files every cycle.
+                        backfillFailures.add(path)
+                    }
+                    processed++
+                }
+            }
+            if (processed < BACKFILL_BATCH) {
+                backfillEnabled = false
+                Log.i(TAG, "OCR backfill complete")
+            } else {
+                Log.i(TAG, "OCR backfill batch done: $processed")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "OCR backfill pass failed", e)
+        }
+    }
+
+    /**
+     * Re-derives category/codes/amounts for entries classified by an older
+     * rule set, using the text already stored in the index (no re-OCR).
+     */
+    private fun migrateClassifierVersions() {
+        try {
+            val stale = OcrStore.all(this).values
+                .filter { it.clsVersion < ScreenshotClassifier.CLS_VERSION }
+            if (stale.isEmpty()) return
+            OcrStore.putAll(this, stale.map { entry ->
+                val result = ScreenshotClassifier.classify(entry.text)
+                entry.copy(
+                    category = result.category,
+                    codes = result.codes,
+                    amounts = result.amounts,
+                    merchant = result.merchant,
+                    clsVersion = ScreenshotClassifier.CLS_VERSION,
+                )
+            })
+            Log.i(TAG, "Reclassified ${stale.size} OCR entries (classifier v${ScreenshotClassifier.CLS_VERSION})")
+        } catch (e: Exception) {
+            Log.w(TAG, "Classifier migration failed", e)
+        }
+    }
+
+    private fun registerObserver() {
+        observer = object : ContentObserver(worker) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                super.onChange(selfChange, uri)
+                Log.d(TAG, "MediaStore changed: $uri")
+                worker.removeCallbacks(scanRunnable)
+                worker.postDelayed(scanRunnable, 700L)
+            }
+        }
+        contentResolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer!!)
+    }
+
+    private fun scanMediaStore() {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val scanStart = System.currentTimeMillis() / 1000L
+        val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.RELATIVE_PATH,
+        ) else arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATA,
+        )
+        val selection = if (baselinePending) null else "${MediaStore.Images.Media.DATE_ADDED} >= ?"
+        val args = if (baselinePending) null else arrayOf((lastScanSeconds - 2L).coerceAtLeast(0L).toString())
+        val found = mutableListOf<Pair<String, String>>()
+        var rowCount = 0
+
+        try {
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                args,
+                "${MediaStore.Images.Media.DATE_ADDED} DESC",
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                val pathColumn = cursor.getColumnIndex(
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                        MediaStore.Images.Media.RELATIVE_PATH else MediaStore.Images.Media.DATA
+                )
+                while (cursor.moveToNext()) {
+                    rowCount++
+                    val id = cursor.getLong(idColumn).toString()
+                    val name = cursor.getString(nameColumn).orEmpty()
+                    val path = if (pathColumn >= 0) cursor.getString(pathColumn).orEmpty() else ""
+                    if (!isScreenshot(name, path)) continue
+                    val uri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id).toString()
+                    if (baselinePending) processedIds.add(uri)
+                    else if (processedIds.add(uri)) found.add(uri to name)
+                }
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "MediaStore scan failed", error)
+            return
+        }
+
+        Log.d(TAG, "MediaStore scan complete: rows=$rowCount newScreenshots=${found.size} baseline=$baselinePending")
+
+        val logFile = File(getExternalFilesDir(null), "service_verification_log.txt")
+        logFile.appendText("[${System.currentTimeMillis()}] SCAN: found=${found.size} processed=${processedIds.size} baselinePending=$baselinePending\n")
+        if (baselinePending) {
+            baselinePending = false
+            prefs.edit().putBoolean(KEY_BASELINED, true).apply()
+        }
+        lastScanSeconds = scanStart
+        prefs.edit().putStringSet(KEY_PROCESSED, processedIds.toSet()).putLong(KEY_LAST_SCAN, lastScanSeconds).apply()
+        found.forEach { (uri, name) -> reportScreenshot(uri, name) }
+    }
+
+    private fun isScreenshot(displayName: String, relativePath: String): Boolean {
+        val name = displayName.lowercase()
+        return relativePath.contains("screenshots", ignoreCase = true) ||
+            name.contains("screenshot") || name.contains("screen_shot") || name.contains("screencap")
+    }
+
+    private fun reportScreenshot(uri: String, displayName: String) {
+        val path = getPathFromUri(uri)
+        val logFile = File(getExternalFilesDir(null), "service_verification_log.txt")
+        logFile.appendText("[${System.currentTimeMillis()}] REPORT: $displayName path=$path count=${count+1}\n")
+        val flutterPrefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+        count = flutterPrefs.getInt("flutter.shotsense_screenshot_count", 0) + 1
+        flutterPrefs.edit().putInt("flutter.shotsense_screenshot_count", count).apply()
+
+        // Auto-pilot rule: schedule retention for the new screenshot instantly,
+        // unless it is pinned (Keep Forever). The rule lives in the shared
+        // Flutter prefs, so changes from the UI apply immediately.
+        var autoScheduled = false
+        val autoEnabled = flutterPrefs.getBoolean("flutter.shotsense_auto_enabled", false)
+        if (autoEnabled && path != null && !DeletionManager.isPinned(this, path)) {
+            val seconds = flutterPrefs.getInt("flutter.shotsense_auto_seconds", 24 * 60 * 60)
+            DeletionManager.scheduleDeletion(this, path, seconds.toLong())
+            autoScheduled = true
+            Log.i(TAG, "Auto-pilot scheduled deletion for $displayName in ${seconds}s")
+        }
+
+        // Content pass: on-device OCR decides what this screenshot is, files
+        // it in the private index, and refines the auto-pilot lifetime.
+        var category = ScreenshotClassifier.CATEGORY_NONE
+        if (path != null) {
+            val entry = runOcr(uri, path, displayName)
+            if (entry != null) {
+                OcrStore.put(this, entry)
+                category = entry.category
+            }
+        }
+        if (autoScheduled && path != null) {
+            when (category) {
+                ScreenshotClassifier.CATEGORY_OTP -> {
+                    // Verification codes are worthless within minutes.
+                    DeletionManager.scheduleDeletion(this, path, 30L * 60L)
+                    Log.i(TAG, "Auto-pilot: OTP screenshot, lifetime shortened to 30 min")
+                }
+                ScreenshotClassifier.CATEGORY_BILL -> {
+                    // Bills and receipts are what people regret losing.
+                    DeletionManager.cancelSchedule(this, path)
+                    Log.i(TAG, "Auto-pilot: bill screenshot protected from auto-delete")
+                }
+                ScreenshotClassifier.CATEGORY_CODE -> {
+                    DeletionManager.scheduleDeletion(this, path, 30L * 24L * 60L * 60L)
+                    Log.i(TAG, "Auto-pilot: code screenshot, lifetime extended to 30 days")
+                }
+            }
+        }
+        updateStatusNotification()
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("action", "schedule_screenshot")
+            putExtra("screenshot_path", path)
+            putExtra("screenshot_name", displayName)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, uri.hashCode(), intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val (title, text) = when (category) {
+            ScreenshotClassifier.CATEGORY_OTP -> if (autoScheduled)
+                "OTP screenshot" to "Auto-cleans in 30 min — trash now if you're done"
+            else "OTP screenshot" to "Tap to schedule deletion"
+            ScreenshotClassifier.CATEGORY_BILL -> if (autoScheduled)
+                "Bill screenshot" to "Filed and protected from auto-delete"
+            else "Bill screenshot" to "Tap to schedule deletion"
+            ScreenshotClassifier.CATEGORY_CODE -> if (autoScheduled)
+                "Code screenshot" to "Codes extracted — kept for 30 days"
+            else "Code screenshot" to "Tap to schedule deletion"
+            else -> if (autoScheduled)
+                "Screenshot detected" to "$displayName — auto-scheduled for deletion, tap to adjust"
+            else "Screenshot detected" to "Tap to schedule deletion for $displayName"
+        }
+        val builder = Notification.Builder(this, ALERT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_gallery)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(Notification.PRIORITY_HIGH)
+        if (category == ScreenshotClassifier.CATEGORY_OTP && path != null) {
+            val trashIntent = Intent(this, NotificationActionReceiver::class.java).apply {
+                action = NotificationActionReceiver.ACTION_TRASH_NOW
+                putExtra(NotificationActionReceiver.EXTRA_PATH, path)
+                putExtra(NotificationActionReceiver.EXTRA_URI, uri)
+            }
+            val trashPi = PendingIntent.getBroadcast(
+                this, ("trash$uri").hashCode(), trashIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                Notification.Action.Builder(0, "Trash now", trashPi).build()
+            )
+        }
+        getSystemService(NotificationManager::class.java).notify(uri.hashCode(), builder.build())
+    }
+
+    /** Runs on-device text recognition on the worker thread and classifies it. */
+    private fun runOcr(uri: String, path: String, displayName: String): OcrStore.Entry? {
+        return try {
+            val image = InputImage.fromFilePath(this, Uri.parse(uri))
+            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            val visionText = try {
+                Tasks.await(recognizer.process(image), 15, TimeUnit.SECONDS)
+            } finally {
+                recognizer.close()
+            }
+            val result = ScreenshotClassifier.classify(visionText.text)
+            Log.i(TAG, "OCR $displayName -> ${result.category}, codes=${result.codes.size}")
+            OcrStore.Entry(
+                path = path,
+                name = displayName,
+                addedAt = System.currentTimeMillis(),
+                category = result.category,
+                codes = result.codes,
+                amounts = result.amounts,
+                merchant = result.merchant,
+                text = visionText.text.take(OcrStore.MAX_TEXT_CHARS),
+                clsVersion = ScreenshotClassifier.CLS_VERSION,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "OCR failed for $displayName", e)
+            null
+        }
+    }
+
+    private fun getPathFromUri(uriString: String): String? = try {
+        contentResolver.query(Uri.parse(uriString), arrayOf(MediaStore.Images.Media.DATA), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    } catch (error: Exception) {
+        Log.w(TAG, "Could not resolve screenshot path", error)
+        null
+    }
+
+    private fun getFlutterCount(): Int = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+        .getInt("flutter.shotsense_screenshot_count", 0)
+
+    private fun buildStatusNotification(): Notification {
+        val scheduled = DeletionManager.getScheduledDeletions(this)
+        val contentText = if (scheduled.isNotEmpty()) {
+            val nextMs = scheduled.values.minOrNull() ?: 0L
+            val nextTime = java.text.SimpleDateFormat("hh:mm a", java.util.Locale.getDefault()).format(java.util.Date(nextMs))
+            "${scheduled.size} scheduled · Next deletion: $nextTime"
+        } else {
+            "No scheduled deletions"
+        }
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("ShotSense is monitoring screenshots")
+            .setContentText(contentText)
+            .setSmallIcon(android.R.drawable.ic_menu_gallery)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun updateStatusNotification() {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildStatusNotification())
+    }
+
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "ShotSense detector", NotificationManager.IMPORTANCE_DEFAULT))
+            manager.createNotificationChannel(NotificationChannel(ALERT_CHANNEL_ID, "Screenshot alerts", NotificationManager.IMPORTANCE_HIGH))
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        updateStatusNotification()
+        return START_STICKY
+    }
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // The user swiped the app away. START_STICKY does not bring the service
+        // back reliably in that case on many OEMs, so schedule an exact restart.
+        if (DeletionManager.isDetectorEnabled(this)) {
+            DeletionManager.scheduleServiceRestart(this)
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
+    override fun onDestroy() {
+        isRunning = false
+        observer?.let { contentResolver.unregisterContentObserver(it) }
+        if (::workerThread.isInitialized) workerThread.quitSafely()
+        super.onDestroy()
+    }
+}
